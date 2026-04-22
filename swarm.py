@@ -27,7 +27,7 @@ from constants import (
     FRAG_HDR,
     DRAIN_TIMEOUT,
     F_DATA, F_PING, F_PONG, F_FRAG, F_GOAWAY,
-    F_HAVE, F_WANT, F_CHUNK, F_BATCH,
+    F_HAVE, F_WANT, F_CHUNK, F_BATCH, F_CHUNK_ACK,
     MCAST_ADDR, MCAST_PORT, F_LAN,
     RTT_ALPHA,
 )
@@ -133,6 +133,7 @@ class Swarm:
         self._storage       = opts.get('storage', None)
         self._want_pending  = {}
         self._chunk_assembly = {}
+        self._reliable_tx   = {}
         self._topic_hash    = None
         self._dht           = None
         self._hb_handle     = None
@@ -582,6 +583,7 @@ class Swarm:
         elif t == F_HAVE:    self._on_have(buf, src)
         elif t == F_WANT:    self._on_want(buf, src)
         elif t == F_CHUNK:   self._on_chunk(buf, src)
+        elif t == F_CHUNK_ACK: self._on_chunk_ack(buf, src)
         elif t == F_RELAY_ANN: self._on_relay_ann(buf, src)
         elif t == F_RELAY_REQ: self._on_relay_req(buf, src)
         elif t == F_RELAY_FWD: self._on_relay_fwd(buf, src)
@@ -841,15 +843,75 @@ class Swarm:
         if not value:
             return
         kb = key.encode()
+
+        # Small value — fire and forget
         if len(value) <= SYNC_CHUNK_SIZE:
             msg = bytes([F_CHUNK, len(kb)]) + kb + struct.pack('>H', len(value)) + value
             peer.write_ctrl(msg)
-        else:
-            total = -(-len(value) // SYNC_CHUNK_SIZE)
+            return
+
+        # Large value — reliable sliding window with ACK
+        total   = -(-len(value) // SYNC_CHUNK_SIZE)
+        tx_key  = f'{key}:{pid}'
+        if tx_key in self._reliable_tx:
+            return
+
+        WINDOW = 8
+        RTO_S  = 1.5
+
+        acked  = [False] * total
+        timers = [None]  * total
+        tx     = {'acked': acked, 'timers': timers, 'done': False}
+        self._reliable_tx[tx_key] = tx
+
+        def cleanup():
+            tx['done'] = True
+            for t in tx['timers']:
+                if t:
+                    t.cancel()
+            self._reliable_tx.pop(tx_key, None)
+
+        # Safety timeout — 60s
+        safety = self._loop.call_later(60, cleanup)
+
+        ip, port_s = peer._best.rsplit(':', 1)
+
+        def send_frame(i):
+            if tx['done'] or tx['acked'][i]:
+                return
+            chunk = value[i * SYNC_CHUNK_SIZE: (i + 1) * SYNC_CHUNK_SIZE]
+            msg   = bytes([F_CHUNK, len(kb)]) + kb + struct.pack('>HHH', 0xFFFF, i, total) + chunk
+            # Send directly — chunk frames are too large for batching (> MTU)
+            try:
+                self._batch.send_now(ip, int(port_s), msg)
+            except Exception:
+                pass
+            if tx['timers'][i]:
+                tx['timers'][i].cancel()
+            tx['timers'][i] = self._loop.call_later(RTO_S, lambda _i=i: send_frame(_i))
+
+        def on_ack(idx):
+            if tx['done']:
+                return
+            tx['acked'][idx] = True
+            if tx['timers'][idx]:
+                tx['timers'][idx].cancel()
+                tx['timers'][idx] = None
+            if all(tx['acked'][i] for i in range(total)):
+                safety.cancel()
+                cleanup()
+                return
+            # Send next unsent frame to keep the window full
             for i in range(total):
-                chunk = value[i * SYNC_CHUNK_SIZE:(i + 1) * SYNC_CHUNK_SIZE]
-                msg   = bytes([F_CHUNK, len(kb)]) + kb + struct.pack('>HHH', 0xFFFF, i, total) + chunk
-                peer.write_ctrl(msg)
+                if not tx['acked'][i] and not tx['timers'][i]:
+                    send_frame(i)
+                    break
+
+        tx['on_ack'] = on_ack
+
+        # Send initial window
+        for i in range(min(WINDOW, total)):
+            send_frame(i)
 
     def _on_chunk(self, buf: bytes, src: str):
         if len(buf) < 4:
@@ -889,11 +951,30 @@ class Swarm:
                 handle = self._loop.call_later(SYNC_TIMEOUT / 1000, _cleanup)
                 self._chunk_assembly[key] = {'total': total, 'pieces': {}, 'handle': handle}
             asm = self._chunk_assembly[key]
-            asm['pieces'][idx] = data
+
+            # Only store if not already received (duplicate protection)
+            if idx not in asm['pieces']:
+                asm['pieces'][idx] = bytes(data)
+
+            # Send ACK after storing — confirms we actually have this piece
+            pid2  = self._addr_to_id.get(src)
+            peer2 = self._peers.get(pid2) if pid2 else None
+            if peer2:
+                kb2 = key.encode()
+                ack = bytes([F_CHUNK_ACK, len(kb2)]) + kb2 + struct.pack('>H', idx)
+                ip2, port2 = peer2._best.rsplit(':', 1)
+                try:
+                    self._batch.send_now(ip2, int(port2), ack)
+                except Exception:
+                    pass
             if len(asm['pieces']) == asm['total']:
                 asm['handle'].cancel()
                 self._chunk_assembly.pop(key, None)
-                value = b''.join(asm['pieces'][i] for i in range(asm['total']))
+                # Build value in order, skip any missing index gracefully
+                parts = [bytes(asm['pieces'][i]) for i in range(asm['total']) if i in asm['pieces']]
+                if len(parts) != asm['total']:
+                    return  # missing pieces — wait for retransmit
+                value = b''.join(parts)
                 self._store.add(key, value)
                 if self._storage:
                     self._loop.create_task(self._storage_set(key, value))
@@ -904,6 +985,23 @@ class Swarm:
                     if not pending['future'].done():
                         pending['future'].set_result(value)
                 self._emit('sync', key, value)
+
+    def _on_chunk_ack(self, buf: bytes, src: str):
+        if len(buf) < 5:
+            return
+        o    = 1
+        klen = buf[o]; o += 1
+        if o + klen + 2 > len(buf):
+            return
+        key = buf[o:o + klen].decode(); o += klen
+        idx = struct.unpack_from('>H', buf, o)[0]
+        pid = self._addr_to_id.get(src)
+        if not pid:
+            return
+        tx = self._reliable_tx.get(f'{key}:{pid}')
+        if not tx or tx['done']:
+            return
+        tx['on_ack'](idx)
 
     def _check_become_relay(self):
         if self._is_relay:

@@ -202,7 +202,6 @@ swarm = Swarm({'storage': storage})
 ```python
 import aiofiles
 import json
-import os
 
 class JSONStorage:
     def __init__(self, path):
@@ -246,6 +245,7 @@ The wire protocol is plain UDP. Each packet starts with a 1-byte frame type:
 | `0x0A` | GOAWAY | graceful disconnect |
 | `0x0B` | FRAG | fragment of a large message |
 | `0x13` | BATCH | multiple frames in one datagram |
+| `0x14` | CHUNK_ACK | acknowledgement for reliable multi-chunk transfers |
 | `0x20` | RELAY_ANN | peer announcing itself as relay |
 | `0x21` | RELAY_REQ | request introduction via relay |
 | `0x22` | RELAY_FWD | relay forwarding an introduction |
@@ -255,6 +255,34 @@ Handshake is two frames: `0xA1` (hello) and `0xA2` (hello ack). Each carries the
 
 The session key derivation label is `p2p-v12-session`. The peer with the lexicographically lower ID uses the first 32 bytes as send key; the other peer flips them.
 For cross-runtime compatibility, that ordering uses the on-wire ID prefix (first 8 bytes / 16 hex chars). If two peers ever collide on that prefix, Python falls back to lexicographic ordering of full X25519 public keys.
+
+### Reliable chunk transfer
+
+When a value larger than 900 bytes is requested via `fetch()`, the sender uses a sliding window protocol instead of fire-and-forget:
+
+1. Sender splits the value into 900-byte chunks and sends the first 8 in parallel (window size = 8)
+2. Receiver sends a `CHUNK_ACK` frame for each chunk it receives
+3. Sender retransmits any chunk that isn't acknowledged within 1.5 seconds (RTO)
+4. As each ACK arrives, the sender advances the window and sends the next unacknowledged chunk
+5. Transfer completes when all chunks are acknowledged; a 60-second safety timeout cleans up any stale state
+
+Small values (≤ 900 bytes) are still fire-and-forget — no ACK needed.
+
+This is what makes large transfers like video files reliable over UDP.
+
+---
+
+## Porting to another language
+
+The minimum you need to implement:
+
+1. X25519 key exchange + HKDF-SHA256 to derive send/recv keys
+2. ChaCha20-Poly1305 encrypt/decrypt with a 12-byte nonce (4-byte session ID + 8-byte counter)
+3. The handshake frames (`0xA1` / `0xA2`)
+4. DATA frame (`0x01`) with the encrypted payload
+5. PING/PONG for keepalive
+
+Everything else (DHT, relay, gossip, PEX, reliable chunks) is optional and can be added incrementally.
 
 ---
 

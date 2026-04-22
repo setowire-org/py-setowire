@@ -94,16 +94,18 @@ STUN_FAST_TIMEOUT = 1500
 TAG_LEN   = 16
 NONCE_LEN = 12
 
-F_DATA   = 0x01
-F_PING   = 0x03
-F_PONG   = 0x04
-F_FRAG   = 0x0B
-F_GOAWAY = 0x0A
-F_HAVE   = 0x10
-F_WANT   = 0x11
-F_CHUNK  = 0x12
-F_BATCH  = 0x13
+F_DATA      = 0x01
+F_PING      = 0x03
+F_PONG      = 0x04
+F_FRAG      = 0x0B
+F_GOAWAY    = 0x0A
+F_HAVE      = 0x10
+F_WANT      = 0x11
+F_CHUNK     = 0x12
+F_BATCH     = 0x13
+F_CHUNK_ACK = 0x14
 
 MCAST_ADDR = '239.0.0.1'
 MCAST_PORT = 45678
 F_LAN      = 0x09
+
